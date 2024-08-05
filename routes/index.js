@@ -20,4 +20,4 @@ router
   .put('/files/:id/unpublish', FilesController.putUnpublish)
   .get('/files/:id/data', FilesController.getFile);
 
-export default router;
+module.exports = router;
