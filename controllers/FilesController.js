@@ -1,124 +1,301 @@
+import { tmpdir } from 'os';
+import { promisify } from 'util';
+import Queue from 'bull/lib/queue';
 import { v4 as uuidv4 } from 'uuid';
-import { promises as fs } from 'fs';
-import { ObjectID } from 'mongodb';
-import mime from 'mime-types';
-import Queue from 'bull';
+import {
+  mkdir, writeFile, stat, existsSync, realpath,
+} from 'fs';
+import { join as joinPath } from 'path';
+import { Request, Response } from 'express';
+import { contentType } from 'mime-types';
+import mongoDBCore from 'mongodb/lib/core';
 import dbClient from '../utils/db';
-import redisClient from '../utils/redis';
+import { getUserFromXToken } from '../utils/auth';
 
-const fileQueue = new Queue('fileQueue', 'redis://127.0.0.1:6379');
+const VALID_FILE_TYPES = {
+  folder: 'folder',
+  file: 'file',
+  image: 'image',
+};
+const ROOT_FOLDER_ID = 0;
+const DEFAULT_ROOT_FOLDER = 'files_manager';
+const mkDirAsync = promisify(mkdir);
+const writeFileAsync = promisify(writeFile);
+const statAsync = promisify(stat);
+const realpathAsync = promisify(realpath);
+const MAX_FILES_PER_PAGE = 20;
+const fileQueue = new Queue('thumbnail generation');
+const NULL_ID = Buffer.alloc(24, '0').toString('utf-8');
+const isValidId = (id) => {
+  const size = 24;
+  let i = 0;
+  const charRanges = [
+    [48, 57], // 0 - 9
+    [97, 102], // a - f
+    [65, 70], // A - F
+  ];
+  if (typeof id !== 'string' || id.length !== size) {
+    return false;
+  }
+  while (i < size) {
+    const c = id[i];
+    const code = c.charCodeAt(0);
 
-class FilesController {
-  static async getUser(request) {
-    const token = request.header('X-Token');
-    const userId = await redisClient.get(`auth_${token}`);
-    if (userId) {
-      const user = await dbClient.db.collection('users').findOne({ _id: new ObjectID(userId) });
-      return user || null;
+    if (!charRanges.some((range) => code >= range[0] && code <= range[1])) {
+      return false;
     }
-    return null;
+    i += 1;
+  }
+  return true;
+};
+
+export default class FilesController {
+  /**
+   * A file is uploaded.
+   * @param {Request} req: The Express request object.
+   * @param {Response} res: The Express response object.
+   */
+  static async postUpload(req, res) {
+    const { user } = req;
+    const name = req.body ? req.body.name : null;
+    const type = req.body ? req.body.type : null;
+    const parentId = req.body && req.body.parentId ? req.body.parentId : ROOT_FOLDER_ID;
+    const isPublic = req.body && req.body.isPublic ? req.body.isPublic : false;
+    const base64Data = req.body && req.body.data ? req.body.data : '';
+
+    if (!name) {
+      res.status(400).json({ error: 'Missing name' });
+      return;
+    }
+    if (!type || !Object.values(VALID_FILE_TYPES).includes(type)) {
+      res.status(400).json({ error: 'Missing type' });
+      return;
+    }
+    if (!req.body.data && type !== VALID_FILE_TYPES.folder) {
+      res.status(400).json({ error: 'Missing data' });
+      return;
+    }
+    if ((parentId !== ROOT_FOLDER_ID) && (parentId !== ROOT_FOLDER_ID.toString())) {
+      const file = await (await dbClient.filesCollection())
+        .findOne({
+          _id: new mongoDBCore.BSON.ObjectId(isValidId(parentId) ? parentId : NULL_ID),
+        });
+
+      if (!file) {
+        res.status(400).json({ error: 'Parent not found' });
+        return;
+      }
+      if (file.type !== VALID_FILE_TYPES.folder) {
+        res.status(400).json({ error: 'Parent is not a folder' });
+        return;
+      }
+    }
+    const userId = user._id.toString();
+    const baseDir = `${process.env.FOLDER_PATH || ''}`.trim().length > 0
+      ? process.env.FOLDER_PATH.trim()
+      : joinPath(tmpdir(), DEFAULT_ROOT_FOLDER);
+    //The default baseDir == '/tmp/files_manager'
+    // or (on Windows) '%USERPROFILE%/AppData/Local/Temp/files_manager';
+    const newFile = {
+      userId: new mongoDBCore.BSON.ObjectId(userId),
+      name,
+      type,
+      isPublic,
+      parentId: (parentId === ROOT_FOLDER_ID) || (parentId === ROOT_FOLDER_ID.toString())
+        ? '0'
+        : new mongoDBCore.BSON.ObjectId(parentId),
+    };
+    await mkDirAsync(baseDir, { recursive: true });
+    if (type !== VALID_FILE_TYPES.folder) {
+      const localPath = joinPath(baseDir, uuidv4());
+      await writeFileAsync(localPath, Buffer.from(base64Data, 'base64'));
+      newFile.localPath = localPath;
+    }
+    const insertionInfo = await (await dbClient.filesCollection())
+      .insertOne(newFile);
+    const fileId = insertionInfo.insertedId.toString();
+    // starting thumbnail generation worker
+    if (type === VALID_FILE_TYPES.image) {
+      const jobName = `Image thumbnail [${userId}-${fileId}]`;
+      fileQueue.add({ userId, fileId, name: jobName });
+    }
+    res.status(201).json({
+      id: fileId,
+      userId,
+      name,
+      type,
+      isPublic,
+      parentId: (parentId === ROOT_FOLDER_ID) || (parentId === ROOT_FOLDER_ID.toString())
+        ? 0
+        : parentId,
+    });
   }
 
-  static async postUpload(request, response) {
-    const user = await FilesController.getUser(request);
-    if (!user) return response.status(401).json({ error: 'Unauthorized' });
+  static async getShow(req, res) {
+    const { user } = req;
+    const id = req.params ? req.params.id : NULL_ID;
+    const userId = user._id.toString();
+    const file = await (await dbClient.filesCollection())
+      .findOne({
+        _id: new mongoDBCore.BSON.ObjectId(isValidId(id) ? id : NULL_ID),
+        userId: new mongoDBCore.BSON.ObjectId(isValidId(userId) ? userId : NULL_ID),
+      });
 
-    const { name, type, parentId, isPublic = false, data } = request.body;
-    if (!name) return response.status(400).json({ error: 'Missing name' });
-    if (!type) return response.status(400).json({ error: 'Missing type' });
-    if (type !== 'folder' && !data) return response.status(400).json({ error: 'Missing data' });
-
-    const files = dbClient.db.collection('files');
-    if (parentId) {
-      const parent = await files.findOne({ _id: new ObjectID(parentId), userId: user._id });
-      if (!parent || parent.type !== 'folder') return response.status(400).json({ error: 'Invalid parent' });
+    if (!file) {
+      res.status(404).json({ error: 'Not found' });
+      return;
     }
+    res.status(200).json({
+      id,
+      userId,
+      name: file.name,
+      type: file.type,
+      isPublic: file.isPublic,
+      parentId: file.parentId === ROOT_FOLDER_ID.toString()
+        ? 0
+        : file.parentId.toString(),
+    });
+  }
 
-    if (type === 'folder') {
-      const result = await files.insertOne({ userId: user._id, name, type, parentId: parentId || 0, isPublic });
-      return response.status(201).json({ id: result.insertedId, userId: user._id, name, type, isPublic, parentId: parentId || 0 });
+  /**
+   * Files associated with a specific user are retrieved.
+   * @param {Request} req: the Express request object.
+   * @param {Response} res: the Express response object.
+   */
+  static async getIndex(req, res) {
+    const { user } = req;
+    const parentId = req.query.parentId || ROOT_FOLDER_ID.toString();
+    const page = /\d+/.test((req.query.page || '').toString())
+      ? Number.parseInt(req.query.page, 10)
+      : 0;
+    const filesFilter = {
+      userId: user._id,
+      parentId: parentId === ROOT_FOLDER_ID.toString()
+        ? parentId
+        : new mongoDBCore.BSON.ObjectId(isValidId(parentId) ? parentId : NULL_ID),
+    };
+
+    const files = await (await (await dbClient.filesCollection())
+      .aggregate([
+        { $match: filesFilter },
+        { $sort: { _id: -1 } },
+        { $skip: page * MAX_FILES_PER_PAGE },
+        { $limit: MAX_FILES_PER_PAGE },
+        {
+          $project: {
+            _id: 0,
+            id: '$_id',
+            userId: '$userId',
+            name: '$name',
+            type: '$type',
+            isPublic: '$isPublic',
+            parentId: {
+              $cond: { if: { $eq: ['$parentId', '0'] }, then: 0, else: '$parentId' },
+            },
+          },
+        },
+      ])).toArray();
+    res.status(200).json(files);
+  }
+
+  static async putPublish(req, res) {
+    const { user } = req;
+    const { id } = req.params;
+    const userId = user._id.toString();
+    const fileFilter = {
+      _id: new mongoDBCore.BSON.ObjectId(isValidId(id) ? id : NULL_ID),
+      userId: new mongoDBCore.BSON.ObjectId(isValidId(userId) ? userId : NULL_ID),
+    };
+    const file = await (await dbClient.filesCollection())
+      .findOne(fileFilter);
+
+    if (!file) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    await (await dbClient.filesCollection())
+      .updateOne(fileFilter, { $set: { isPublic: true } });
+    res.status(200).json({
+      id,
+      userId,
+      name: file.name,
+      type: file.type,
+      isPublic: true,
+      parentId: file.parentId === ROOT_FOLDER_ID.toString()
+        ? 0
+        : file.parentId.toString(),
+    });
+  }
+
+  static async putUnpublish(req, res) {
+    const { user } = req;
+    const { id } = req.params;
+    const userId = user._id.toString();
+    const fileFilter = {
+      _id: new mongoDBCore.BSON.ObjectId(isValidId(id) ? id : NULL_ID),
+      userId: new mongoDBCore.BSON.ObjectId(isValidId(userId) ? userId : NULL_ID),
+    };
+    const file = await (await dbClient.filesCollection())
+      .findOne(fileFilter);
+
+    if (!file) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    await (await dbClient.filesCollection())
+      .updateOne(fileFilter, { $set: { isPublic: false } });
+    res.status(200).json({
+      id,
+      userId,
+      name: file.name,
+      type: file.type,
+      isPublic: false,
+      parentId: file.parentId === ROOT_FOLDER_ID.toString()
+        ? 0
+        : file.parentId.toString(),
+    });
+  }
+
+  /**
+   * The content of a file is retrieved.
+   * @param {Request} req is Express request object.
+   * @param {Response} res is Express response object.
+   */
+  static async getFile(req, res) {
+    const user = await getUserFromXToken(req);
+    const { id } = req.params;
+    const size = req.query.size || null;
+    const userId = user ? user._id.toString() : '';
+    const fileFilter = {
+      _id: new mongoDBCore.BSON.ObjectId(isValidId(id) ? id : NULL_ID),
+    };
+    const file = await (await dbClient.filesCollection())
+      .findOne(fileFilter);
+
+    if (!file || (!file.isPublic && (file.userId.toString() !== userId))) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    if (file.type === VALID_FILE_TYPES.folder) {
+      res.status(400).json({ error: 'A folder doesn\'t have content' });
+      return;
+    }
+    let filePath = file.localPath;
+    if (size) {
+      filePath = `${file.localPath}_${size}`;
+    }
+    if (existsSync(filePath)) {
+      const fileInfo = await statAsync(filePath);
+      if (!fileInfo.isFile()) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
     } else {
-      const filePath = process.env.FOLDER_PATH || '/tmp/files_manager';
-      const fileName = `${filePath}/${uuidv4()}`;
-      const buff = Buffer.from(data, 'base64');
-      await fs.mkdir(filePath, { recursive: true });
-      await fs.writeFile(fileName, buff);
-
-      const result = await files.insertOne({ userId: user._id, name, type, isPublic, parentId: parentId || 0, localPath: fileName });
-      response.status(201).json({ id: result.insertedId, userId: user._id, name, type, isPublic, parentId: parentId || 0 });
-
-      if (type === 'image') fileQueue.add({ userId: user._id, fileId: result.insertedId });
+      res.status(404).json({ error: 'Not found' });
+      return;
     }
-  }
-
-  static async getShow(request, response) {
-    const user = await FilesController.getUser(request);
-    if (!user) return response.status(401).json({ error: 'Unauthorized' });
-
-    const file = await dbClient.db.collection('files').findOne({ _id: new ObjectID(request.params.id), userId: user._id });
-    if (!file) return response.status(404).json({ error: 'Not found' });
-
-    response.status(200).json(file);
-  }
-
-  static async getIndex(request, response) {
-    const user = await FilesController.getUser(request);
-    if (!user) return response.status(401).json({ error: 'Unauthorized' });
-
-    const { parentId, page = 0 } = request.query;
-    const query = { userId: user._id, ...(parentId && { parentId: new ObjectID(parentId) }) };
-    const files = await dbClient.db.collection('files').aggregate([
-      { $match: query },
-      { $sort: { _id: -1 } },
-      { $facet: { metadata: [{ $count: 'total' }, { $addFields: { page: parseInt(page, 10) } }], data: [{ $skip: 20 * parseInt(page, 10) }, { $limit: 20 }] } },
-    ]).toArray();
-
-    const result = files[0].data.map(file => ({ ...file, id: file._id, _id: undefined, localPath: undefined }));
-    response.status(200).json(result);
-  }
-
-  static async putPublish(request, response) {
-    return FilesController.updateFilePublishStatus(request, response, true);
-  }
-
-  static async putUnpublish(request, response) {
-    return FilesController.updateFilePublishStatus(request, response, false);
-  }
-
-  static async updateFilePublishStatus(request, response, isPublic) {
-    const user = await FilesController.getUser(request);
-    if (!user) return response.status(401).json({ error: 'Unauthorized' });
-
-    const result = await dbClient.db.collection('files').findOneAndUpdate(
-      { _id: new ObjectID(request.params.id), userId: user._id },
-      { $set: { isPublic } },
-      { returnOriginal: false }
-    );
-
-    if (!result.lastErrorObject.updatedExisting) return response.status(404).json({ error: 'Not found' });
-    response.status(200).json(result.value);
-  }
-
-  static async getFile(request, response) {
-    const file = await dbClient.db.collection('files').findOne({ _id: new ObjectID(request.params.id) });
-    if (!file) return response.status(404).json({ error: 'Not found' });
-
-    if (!file.isPublic) {
-      const user = await FilesController.getUser(request);
-      if (!user || file.userId.toString() !== user._id.toString()) return response.status(404).json({ error: 'Not found' });
-    }
-
-    if (file.type === 'folder') return response.status(400).json({ error: "A folder doesn't have content" });
-
-    const fileName = request.param('size') ? `${file.localPath}_${request.param('size')}` : file.localPath;
-    try {
-      const data = await fs.readFile(fileName);
-      const contentType = mime.contentType(file.name);
-      response.header('Content-Type', contentType).status(200).send(data);
-    } catch {
-      response.status(404).json({ error: 'Not found' });
-    }
+    const absoluteFilePath = await realpathAsync(filePath);
+    res.setHeader('Content-Type', contentType(file.name) || 'text/plain; charset=utf-8');
+    res.status(200).sendFile(absoluteFilePath);
   }
 }
-
-module.exports = FilesController;
