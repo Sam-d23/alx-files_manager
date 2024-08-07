@@ -2,23 +2,52 @@ import { ObjectID } from 'mongodb';
 import redisClient from './redis';
 import dbClient from './db';
 
-// User ID is retrieved from the token in request headers
+// Retrieving authentication token from the headers
+async function getAuthToken(request) {
+  const token = request.headers['X-token'];
+  return `auth_${token}`;
+}
+
+// Finding user ID based on the token passed in the headers
 async function findUserIdByToken(request) {
-  const token = request.headers['X-Token'];
-  return await redisClient.get(`auth_${token}`) || null;
+  const key = await getAuthToken(request);
+  const userId = await redisClient.get(key);
+  return userId || null;
 }
 
-// Finding a user in the database by their ID
+// Finding user in the database based on the user ID
 async function findUserById(userId) {
-  return await dbClient.db.collection('users').findOne({ _id: new ObjectID(userId) }) || null;
+  const userExistsArray = await dbClient.users.find(`ObjectId("${userId}")`).toArray();
+  return userExistsArray[0] || null;
 }
 
-// Combines token retrieval and user lookup into one function
-async function getUser(request) {
+async function getUserById(request) {
   const userId = await findUserIdByToken(request);
-  return userId ? await findUserById(userId) : null;
+  if (userId) {
+    const users = dbClient.db.collection('users');
+    const objectId = new ObjectID(userId);
+    const user = await users.findOne({ _id: objectId });
+    return user || null;
+  }
+  return null;
+}
+
+async function getUser(request) {
+  const token = request.header('X-Token');
+  const key = `auth_${token}`;
+  const userId = await redisClient.get(key);
+  if (userId) {
+    const users = dbClient.db.collection('users');
+    const idObject = new ObjectID(userId);
+    const user = await users.findOne({ _id: idObject });
+    return user || null;
+  }
+  return null;
 }
 
 export {
-  findUserIdByToken, findUserById, getUser,
+  findUserIdByToken,
+  findUserById,
+  getUserById,
+  getUser,
 };
